@@ -6,7 +6,7 @@ authors = [{ name = "Paul Diegert", email = "pdiegert@gmail.com" }]
 requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }
 dynamic = ["version"]
-dependencies = [ "jaxlib>=0.5.0,<=0.6.0", "jax>=0.5.0,<=0.6.0", "equinox>=0.11.12,<0.12", "mixsqpx==0.1.1"
+dependencies = [ "jaxlib>=0.5.0,<=0.6.0", "jax>=0.5.0,<=0.6.0", "equinox>=0.11.12,<0.12", "mixsqpx==0.1.3dev1"
 ]
 
 [dependency-groups]
@@ -36,7 +36,6 @@ dev = { features = ["dev"], solve-group = "default" }
 [tool.pixi.dependencies]
 numpy = ">=2.2.5,<3"
 
-
 [tool.pixi.feature.dev.dependencies]
 pandas = ">=2.2.3,<3"
 matplotlib = ">=3.10.1,<4"
@@ -50,9 +49,4 @@ nbclient = ">=0.10.2,<0.11"
 
 [tool.pixi.feature.dev.tasks]
 test = "pytest -s tests -p no:warnings"
-build = "python -m build"
 ipykernel = "python -m ipykernel install --user --name spmlex"
-
-[tool.pixi.pypi-options]
-index-url = "https://test.pypi.org/simple/"
-extra-index-urls = ["https://pypi.org/simple/"]
