@@ -6,7 +6,7 @@ authors = [{ name = "Paul Diegert", email = "pdiegert@gmail.com" }]
 requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }
 dynamic = ["version"]
-dependencies = [ "jaxlib>=0.4.35,<0.5", "jax>=0.4.35,<0.5", "equinox>=0.11.12,<0.12", "mixsqpx==0.1.0"
+dependencies = [ "jaxlib>=0.5.0,<=0.6.0", "jax>=0.5.0,<=0.6.0", "equinox>=0.11.12,<0.12", "mixsqpx==0.1.1"
 ]
 
 [dependency-groups]
@@ -35,11 +35,7 @@ dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.dependencies]
 numpy = ">=2.2.5,<3"
-armadillo = ">=14.4.2,<15"
-openblas = ">=0.3.29,<0.4"
-pybind11 = ">=2.13.6,<3"
-pip = ">=25.1.1,<26"
-ipykernel = ">=6.29.5,<7"
+
 
 [tool.pixi.feature.dev.dependencies]
 pandas = ">=2.2.3,<3"
