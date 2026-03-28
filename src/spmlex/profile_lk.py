@@ -1,5 +1,6 @@
-__all__ = ["profile_ll"]
+__all__ = ["profile_ll", "profile_ll_diagnostics"]
 
+from time import perf_counter
 from typing import Protocol, Any
 
 import jax
@@ -9,6 +10,7 @@ import jax.numpy as np
 import numpy as onp
 
 from mixsqpx import mixsolve
+
 
 class LogLikelihood(Protocol):
     def __call__(
@@ -155,6 +157,188 @@ def profile_ll_jac(primals, tangents):
     return (primal_out, probs_out), (tangent_out, probs_out)
 
 
+def profile_ll_diagnostics(
+    model,
+    data,
+    supp,
+    endog_dummies: onp.ndarray | None = None,
+    weights: onp.ndarray | None = None,
+    *,
+    include_gradient: bool = True,
+):
+    endog_dummies, weights = _default_groups(data, endog_dummies, weights)
+
+    forward = _forward_diagnostics(
+        model=model,
+        data=data,
+        supp=supp,
+        endog_dummies=endog_dummies,
+        weights=weights,
+    )
+    gradient = (
+        _gradient_diagnostics(
+            model=model,
+            data=data,
+            supp=supp,
+            endog_dummies=endog_dummies,
+            weights=weights,
+        )
+        if include_gradient
+        else None
+    )
+
+    return {
+        "nobs": int(_get_nobs(data)),
+        "nsupp": int(supp.shape[0]),
+        "ngroups": int(endog_dummies.shape[1]),
+        "forward": forward,
+        "gradient": gradient,
+    }
+
+
+def _forward_diagnostics(*, model, data, supp, endog_dummies, weights):
+    diagnostics: dict[str, Any] = {"groups": []}
+
+    lclk_, lclk_seconds = _timed_call(lambda: model.lclk(data, supp))
+    diagnostics["lclk_seconds"] = lclk_seconds
+
+    probs: list[np.ndarray] = []
+    neg_ll_terms: list[np.ndarray] = []
+    mixsolve_total = 0.0
+    negloglik_total = 0.0
+
+    for group_index, (weight_i, i) in enumerate(zip(weights, endog_dummies.T, strict=False)):
+        probs_i, ll_jac_probs_i, ll_hess_probs_i, mixsolve_seconds = _timed_mixsolve(lclk_[i, :])
+        neg_ll_i, negloglik_seconds = _timed_call(
+            lambda probs_i=probs_i, i=i: weight_i * negloglik_numeric(probs_i, lclk_[i, :])
+        )
+        probs.append(probs_i)
+        neg_ll_terms.append(neg_ll_i)
+        mixsolve_total += mixsolve_seconds
+        negloglik_total += negloglik_seconds
+        diagnostics["groups"].append(
+            {
+                "group_index": group_index,
+                "group_size": int(i.sum()),
+                "mixsolve_seconds": mixsolve_seconds,
+                "negloglik_seconds": negloglik_seconds,
+                "jac_shape": tuple(ll_jac_probs_i.shape),
+                "hess_shape": tuple(ll_hess_probs_i.shape),
+            }
+        )
+
+    probs_stacked = np.column_stack(probs)
+    objective, total_objective_seconds = _timed_call(lambda: np.array(neg_ll_terms).sum())
+    has_nans = bool(onp.asarray(np.any(np.isnan(probs_stacked))))
+
+    diagnostics["mixsolve_seconds"] = mixsolve_total
+    diagnostics["negloglik_seconds"] = negloglik_total
+    diagnostics["objective_seconds"] = total_objective_seconds
+    diagnostics["has_nans"] = has_nans
+    diagnostics["objective"] = objective
+    diagnostics["probs"] = probs_stacked
+    diagnostics["total_seconds"] = lclk_seconds + mixsolve_total + negloglik_total + total_objective_seconds
+    return diagnostics
+
+
+def _gradient_diagnostics(*, model, data, supp, endog_dummies, weights):
+    diagnostics: dict[str, Any] = {"groups": []}
+
+    lclk_, lclk_seconds = _timed_call(lambda: model.lclk(data, supp))
+    clk_, clk_seconds = _timed_call(lambda: np.exp(lclk_))
+    clk_jac_, clk_jac_seconds = _timed_call(lambda: clk_jac(model, data, supp))
+
+    nobs, _ = lclk_.shape
+    mixsolve_total = 0.0
+    ll_jac_total = 0.0
+    negloglik_total = 0.0
+    primal_terms: list[np.ndarray] = []
+    tangent_terms = []
+    probs_out = []
+
+    for group_index, i in enumerate(endog_dummies.T):
+        probs_i, ll_jac_probs_i, ll_hess_probs_i, mixsolve_seconds = _timed_mixsolve(lclk_[i, :])
+        clk_jac_i = jax.tree_util.tree_map(lambda theta_g: theta_g[i], clk_jac_)
+        theta_jac_i, ll_jac_seconds = _timed_call(
+            lambda probs_i=probs_i, i=i, clk_jac_i=clk_jac_i, ll_jac_probs_i=ll_jac_probs_i, ll_hess_probs_i=ll_hess_probs_i: ll_jac(
+                probs_i,
+                clk_[i],
+                clk_jac_i,
+                ll_jac_probs_i,
+                ll_hess_probs_i,
+            )
+        )
+        primal_out_i, negloglik_seconds = _timed_call(
+            lambda probs_i=probs_i, i=i: (i.sum() / nobs) * negloglik_numeric(probs_i, lclk_[i, :])
+        )
+        tangent_out_i = (i.sum() / nobs) * theta_jac_i
+
+        primal_terms.append(primal_out_i)
+        tangent_terms.append(tangent_out_i)
+        probs_out.append(probs_i)
+        mixsolve_total += mixsolve_seconds
+        ll_jac_total += ll_jac_seconds
+        negloglik_total += negloglik_seconds
+        diagnostics["groups"].append(
+            {
+                "group_index": group_index,
+                "group_size": int(i.sum()),
+                "mixsolve_seconds": mixsolve_seconds,
+                "ll_jac_seconds": ll_jac_seconds,
+                "negloglik_seconds": negloglik_seconds,
+            }
+        )
+
+    primal_out, primal_seconds = _timed_call(lambda: sum(primal_terms))
+    tangent_template, tangent_seconds = _timed_call(lambda: sum(tangent_terms))
+    probs_stacked, probs_seconds = _timed_call(lambda: np.column_stack(probs_out))
+
+    diagnostics["lclk_seconds"] = lclk_seconds
+    diagnostics["clk_seconds"] = clk_seconds
+    diagnostics["clk_jac_seconds"] = clk_jac_seconds
+    diagnostics["mixsolve_seconds"] = mixsolve_total
+    diagnostics["ll_jac_seconds"] = ll_jac_total
+    diagnostics["negloglik_seconds"] = negloglik_total
+    diagnostics["primal_seconds"] = primal_seconds
+    diagnostics["tangent_template_seconds"] = tangent_seconds
+    diagnostics["probs_seconds"] = probs_seconds
+    diagnostics["primal_out"] = primal_out
+    diagnostics["tangent_template"] = tangent_template
+    diagnostics["probs"] = probs_stacked
+    diagnostics["total_seconds"] = (
+        lclk_seconds
+        + clk_seconds
+        + clk_jac_seconds
+        + mixsolve_total
+        + ll_jac_total
+        + negloglik_total
+        + primal_seconds
+        + tangent_seconds
+        + probs_seconds
+    )
+    return diagnostics
+
+
+def _timed_mixsolve(lclk_group):
+    result, elapsed = _timed_call(lambda: mixsolve(lclk_group))
+    probs_i, ll_jac_probs_i, ll_hess_probs_i, *_ = result
+    return probs_i, ll_jac_probs_i, ll_hess_probs_i, elapsed
+
+
+def _timed_call(fn):
+    start = perf_counter()
+    value = fn()
+    _sync_tree(value)
+    elapsed = perf_counter() - start
+    return value, elapsed
+
+
+def _sync_tree(value):
+    for leaf in jax.tree_util.tree_leaves(value):
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+
+
 def _default_groups(data, endog_dummies, weights):
     """
     Create a default group structure for the endog_dummies.
@@ -167,10 +351,10 @@ def _default_groups(data, endog_dummies, weights):
     return endog_dummies, weights
 
 
+
 def _get_nobs(data):
     vals = list(data.values())[0]
     if isinstance(vals, dict):
         return _get_nobs(vals)
     else:
         return vals.shape[0]
-
