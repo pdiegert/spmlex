@@ -9,7 +9,7 @@ dynamic = ["version"]
 dependencies = [
  "jaxlib>=0.9.2,<=0.9.2",
  "jax>=0.9.2,<=0.9.2",
- "mixsqpx>=0.1.5",
+ "mixsqpx==0.2.3a1",
  "equinox>=0.13.6,<0.14",
 ]
 

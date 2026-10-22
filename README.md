@@ -7,6 +7,68 @@ estimation with [Jax](https://github.com/jax-ml/jax). It provides a
 computationally efficient method for estimating economic models with
 permanent unobserved heterogeneity.
 
+## Profile likelihood derivatives and solver controls
+
+`profile_ll` returns the negative mean profile log likelihood and a matrix of
+fitted masses with shape `(nsupp, ngroups)`. Its default differentiation mode
+uses the full chain rule through the fitted masses, whose derivative solves
+the simplex KKT equations. The envelope gradient is an explicit option:
+
+```python
+from spmlex import ProfileOptions, profile_ll
+
+value, masses = profile_ll(model, data, support)  # full implicit differentiation
+envelope_options = ProfileOptions(differentiation="envelope")
+value, masses = profile_ll(model, data, support, options=envelope_options)
+```
+
+Both modes retain the implicit mass response for second derivatives. Standard
+JAX transformations, including `jax.grad`, `jax.jvp`, and `jax.hessian`, apply
+to the objective. JVPs of the returned masses give their actual sensitivity.
+These derivatives are local to a fixed active support with nonsingular reduced
+curvature; a classical Hessian need not exist at a support change.
+
+The same positive density offset is used by the inner solve, value, gradient
+and Hessian. The default is `1e-6 / n_group`, with `n_group` counting the supplied
+rows in that group. With row maximum `m`, the regularized log components are
+`m + log(exp(log_components - m) + offset)`; differentiation retains the
+dependence of `m` on the model. Configure the rule and Rust controls with:
+
+```python
+from spmlex import MixtureSolverOptions, ProfileOptions
+
+options = ProfileOptions(
+    density_offset_scale=1e-6,
+    density_offset_rule="inverse_sample_size",  # or "constant"
+    solver=MixtureSolverOptions(control_sqp=1e-9, tol_svd=1e-10),
+)
+```
+
+`observation_weights` is a nonnegative length-`nobs` vector used in each Rust
+solve. `group_weights` is a separate length-`ngroups` vector controlling outer
+aggregation; both are normalized. By default, groups are aggregated using their
+shares of observation weight. Every group must have positive observation weight.
+Zero-weight rows are ignored by the solve; they still count in `n_group` for the
+inverse-sample-size offset. Frequency weights match repeated observations when
+using the same fixed offset.
+
+Supply `endog_dummies` as a concrete NumPy boolean partition of shape
+`(nobs, ngroups)`, closed over by a JIT-compiled objective. `profile_mixture`
+provides the same interface starting directly from a `(nobs, nsupp)` log-component
+matrix. `profile_ll` accepts any model implementing `model.lclk(data, support)`.
+Use `group_weights` in place of the previous ambiguous `weights` argument; the
+unused `cpp` argument has been removed.
+
+`profile_ll_diagnostics` and `profile_mixture_diagnostics` return typed
+`ProfileDiagnostics` records with per-group offsets, Rust status, KKT residuals,
+and timings. The regular profiling functions reject uncertified inner solutions.
+Diagnostics permit inspection of a failed candidate and omit its gradient.
+All solves use Rust, including observation-weighted problems.
+
+The dependency is pinned to `mixsqpx==0.2.3a1`, which provides observation
+weighting and native ABI 3. Install with `uv sync` to use the published package;
+no sibling checkout or local Rust toolchain is required when a wheel is available.
+
 ## Background
 
 This package implements the estimator described in Section 5 of

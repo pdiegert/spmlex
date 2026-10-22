@@ -1,360 +1,337 @@
-__all__ = ["profile_ll", "profile_ll_diagnostics"]
+"""Grouped, weighted profile likelihoods with implicit or envelope gradients."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 from time import perf_counter
-from typing import Protocol, Any
+from typing import Any, Protocol
 
 import jax
-from jax import jacfwd, custom_jvp, jit
-from jax import flatten_util
-import jax.numpy as np
-import numpy as onp
+import jax.numpy as jnp
+import numpy as np
+from mixsqpx import MixSolveInfo
 
-from mixsqpx import mixsolve
-
-
-class LogLikelihood(Protocol):
-    def __call__(
-        self,
-        theta,
-        data: dict[str, np.ndarray],
-        supp: np.ndarray,
-        **kwargs: Any,
-    ) -> np.ndarray: ...
+from .mixture import (
+    envelope_value,
+    mixture_value,
+    normalized_weights,
+    regularized_log_components,
+    rust_solve,
+    solve_mixture_weights,
+)
+from .options import ProfileOptions
 
 
 class ModelWithLCLK(Protocol):
-    def lclk(
-        self, data: dict[str, np.ndarray], supp: np.ndarray, **kwargs: Any
-    ) -> np.ndarray: ...
+    def lclk(self, data: Any, supp: jax.Array) -> jax.Array: ...
 
 
-@jit
-def negloglik_numeric(probs: np.ndarray, lclk_: np.ndarray) -> np.ndarray:
-    ll_ = jax.nn.logsumexp(lclk_ + np.log(probs)[None, :], axis=1).mean()
-    return -ll_
+@dataclass(frozen=True)
+class GroupDiagnostics:
+    group_index: int
+    nobs: int
+    density_offset: float
+    aggregation_weight: float
+    objective: float
+    solver_info: MixSolveInfo
+    solve_seconds: float
+    value_seconds: float
+
+    @property
+    def converged(self) -> bool:
+        return int(self.solver_info.status) == 0
 
 
-@jit
-def ll_jac(probs, clk, clk_jac, ll_jac_probs, ll_hess_probs):
-    lambd = -(ll_jac_probs + 1)
+@dataclass(frozen=True)
+class ProfileDiagnostics:
+    nobs: int
+    nsupp: int
+    ngroups: int
+    options: ProfileOptions
+    objective: jax.Array
+    probabilities: jax.Array
+    groups: tuple[GroupDiagnostics, ...]
+    log_components_seconds: float
+    solve_seconds: float
+    value_seconds: float
+    total_seconds: float
+    gradient: Any | None
+    gradient_seconds: float | None
+    gradient_objective_error: float | None
 
-    nobs_j, nsupp = clk.shape
+    @property
+    def converged(self) -> bool:
+        return all(group.converged for group in self.groups)
 
-    m = np.vstack(
-        [
-            np.hstack([ll_hess_probs, np.eye(nsupp)]),
-            np.hstack([np.diag(lambd), np.diag(probs)]),
-        ]
-    )
 
-    wgts = 1 / (clk @ probs)  # (obs, )
+def _reject_weights(weights):
+    raise ValueError("Weights must be finite and nonnegative with positive total.")
 
-    # (obs, supp, supp)
-    gg = (
-        np.eye(nsupp)[None, :, :]
-        - (probs[None, None, :] * clk[:, :, None] * wgts[:, None, None])
-    ) * wgts[:, None, None]
 
-    b = jax.tree_util.tree_map(
-        lambda clk_jac_g: (
-            -np.einsum("ikl, il... -> ik...", gg, clk_jac_g).mean(axis=0)
+@jax.custom_jvp
+def _checked_weights(weights):
+    valid = jnp.all(jnp.isfinite(weights) & (weights >= 0)) & jnp.any(weights > 0)
+    return jax.lax.cond(
+        valid,
+        lambda: weights,
+        lambda: jax.pure_callback(
+            _reject_weights, jax.ShapeDtypeStruct(weights.shape, weights.dtype), weights
         ),
-        clk_jac,
     )
 
-    b, _ = jax.tree_util.tree_flatten(b)
-    b = [b_.reshape((nsupp, -1)) for b_ in b]
-    b = np.hstack(b)
-    _, nparam = b.shape
-    b = np.vstack([b, np.zeros((nsupp, nparam))])
 
-    jac_p = np.linalg.solve(-m, b)[:nsupp]
-
-    clk_jac, _ = jax.tree_util.tree_flatten(clk_jac)
-    clk_jac = [clk_jac_g.reshape((nobs_j, nsupp, -1)) for clk_jac_g in clk_jac]
-    clk_jac = np.concatenate(clk_jac, axis=2)
-
-    jac_ll = -wgts[:, None, None] * (
-        clk_jac * probs[None, :, None] + jac_p[None, :, :] * clk[:, :, None]
-    )
-    jac_ll = jac_ll.sum(axis=1).mean(axis=0)
-
-    return jac_ll
+@_checked_weights.defjvp
+def _checked_weights_jvp(primals, tangents):
+    return _checked_weights(primals[0]), tangents[0]
 
 
-@jit
-@jacfwd
-def clk_jac(model: ModelWithLCLK, data: dict[str, np.ndarray], supp: np.ndarray):
-    return np.exp(model.lclk(data, supp))
-
-
-@custom_jvp
-def profile_ll(
-    model,
-    data,
-    supp,
-    endog_dummies: onp.ndarray | None = None,
-    weights: onp.ndarray | None = None,
-    cpp: bool = True,
-):
-
-    endog_dummies, weights = _default_groups(data, endog_dummies, weights)
-
-    lclk_ = model.lclk(data, supp)
-    probs = [mixsolve(lclk_[i, :])[0] for i in endog_dummies.T]
-    probs_stacked = np.column_stack(probs)
-
-    def error_case(x):
-        return jax.lax.stop_gradient(np.inf), jax.lax.stop_gradient(
-            np.zeros_like(probs_stacked)
-        )
-
-    def success_case(x):
-        neg_lls_ = np.array(
-            [
-                weight_i * negloglik_numeric(probs_i, lclk_[i, :])
-                for weight_i, probs_i, i in zip(weights, probs, endog_dummies.T)
-            ]
-        )
-        return neg_lls_.sum(), probs_stacked
-
-    has_nans = np.any(np.isnan(probs_stacked))
-    return jax.lax.cond(has_nans, error_case, success_case, None)
-
-
-@profile_ll.defjvp
-def profile_ll_jac(primals, tangents):
-    model, data, supp, endog_dummies, weights, cpp = primals
-    model_dot, *_ = tangents
-    model_dot, _ = flatten_util.ravel_pytree(model_dot)
-
-    endog_dummies, weights = _default_groups(data, endog_dummies, weights)
-
-    lclk_ = model.lclk(data, supp)
-    clk_ = np.exp(lclk_)
-    clk_jac_ = clk_jac(model, data, supp)
-
-    nobs, _ = lclk_.shape
-
-    def _jvp_group(i):
-        probs_i, ll_jac_probs_i, ll_hess_probs_i, *_ = mixsolve(lclk_[i, :])
-        clk_jac_i = jax.tree_util.tree_map(lambda theta_g: theta_g[i], clk_jac_)
-        theta_jac_i = ll_jac(
-            probs_i, clk_[i], clk_jac_i, ll_jac_probs_i, ll_hess_probs_i
-        )
-
-        primal_out_i = (i.sum() / nobs) * negloglik_numeric(probs_i, lclk_[i, :])
-        tangent_out_i = (i.sum() / nobs) * theta_jac_i
-
-        return primal_out_i, tangent_out_i, probs_i
-
-    jvp_groups = [_jvp_group(i) for i in endog_dummies.T]
-
-    primal_out = sum([jvp_group[0] for jvp_group in jvp_groups])
-    tangent_out = sum([jvp_group[1] for jvp_group in jvp_groups]) @ model_dot
-    probs_out = np.column_stack([jvp_group[2] for jvp_group in jvp_groups])
-
-    return (primal_out, probs_out), (tangent_out, probs_out)
-
-
-def profile_ll_diagnostics(
-    model,
-    data,
-    supp,
-    endog_dummies: onp.ndarray | None = None,
-    weights: onp.ndarray | None = None,
-    *,
-    include_gradient: bool = True,
-):
-    endog_dummies, weights = _default_groups(data, endog_dummies, weights)
-
-    forward = _forward_diagnostics(
-        model=model,
-        data=data,
-        supp=supp,
-        endog_dummies=endog_dummies,
-        weights=weights,
-    )
-    gradient = (
-        _gradient_diagnostics(
-            model=model,
-            data=data,
-            supp=supp,
-            endog_dummies=endog_dummies,
-            weights=weights,
-        )
-        if include_gradient
-        else None
-    )
-
-    return {
-        "nobs": int(_get_nobs(data)),
-        "nsupp": int(supp.shape[0]),
-        "ngroups": int(endog_dummies.shape[1]),
-        "forward": forward,
-        "gradient": gradient,
-    }
-
-
-def _forward_diagnostics(*, model, data, supp, endog_dummies, weights):
-    diagnostics: dict[str, Any] = {"groups": []}
-
-    lclk_, lclk_seconds = _timed_call(lambda: model.lclk(data, supp))
-    diagnostics["lclk_seconds"] = lclk_seconds
-
-    probs: list[np.ndarray] = []
-    neg_ll_terms: list[np.ndarray] = []
-    mixsolve_total = 0.0
-    negloglik_total = 0.0
-
-    for group_index, (weight_i, i) in enumerate(zip(weights, endog_dummies.T, strict=False)):
-        probs_i, ll_jac_probs_i, ll_hess_probs_i, mixsolve_seconds = _timed_mixsolve(lclk_[i, :])
-        neg_ll_i, negloglik_seconds = _timed_call(
-            lambda probs_i=probs_i, i=i: weight_i * negloglik_numeric(probs_i, lclk_[i, :])
-        )
-        probs.append(probs_i)
-        neg_ll_terms.append(neg_ll_i)
-        mixsolve_total += mixsolve_seconds
-        negloglik_total += negloglik_seconds
-        diagnostics["groups"].append(
-            {
-                "group_index": group_index,
-                "group_size": int(i.sum()),
-                "mixsolve_seconds": mixsolve_seconds,
-                "negloglik_seconds": negloglik_seconds,
-                "jac_shape": tuple(ll_jac_probs_i.shape),
-                "hess_shape": tuple(ll_hess_probs_i.shape),
-            }
-        )
-
-    probs_stacked = np.column_stack(probs)
-    objective, total_objective_seconds = _timed_call(lambda: np.array(neg_ll_terms).sum())
-    has_nans = bool(onp.asarray(np.any(np.isnan(probs_stacked))))
-
-    diagnostics["mixsolve_seconds"] = mixsolve_total
-    diagnostics["negloglik_seconds"] = negloglik_total
-    diagnostics["objective_seconds"] = total_objective_seconds
-    diagnostics["has_nans"] = has_nans
-    diagnostics["objective"] = objective
-    diagnostics["probs"] = probs_stacked
-    diagnostics["total_seconds"] = lclk_seconds + mixsolve_total + negloglik_total + total_objective_seconds
-    return diagnostics
-
-
-def _gradient_diagnostics(*, model, data, supp, endog_dummies, weights):
-    diagnostics: dict[str, Any] = {"groups": []}
-
-    lclk_, lclk_seconds = _timed_call(lambda: model.lclk(data, supp))
-    clk_, clk_seconds = _timed_call(lambda: np.exp(lclk_))
-    clk_jac_, clk_jac_seconds = _timed_call(lambda: clk_jac(model, data, supp))
-
-    nobs, _ = lclk_.shape
-    mixsolve_total = 0.0
-    ll_jac_total = 0.0
-    negloglik_total = 0.0
-    primal_terms: list[np.ndarray] = []
-    tangent_terms = []
-    probs_out = []
-
-    for group_index, i in enumerate(endog_dummies.T):
-        probs_i, ll_jac_probs_i, ll_hess_probs_i, mixsolve_seconds = _timed_mixsolve(lclk_[i, :])
-        clk_jac_i = jax.tree_util.tree_map(lambda theta_g: theta_g[i], clk_jac_)
-        theta_jac_i, ll_jac_seconds = _timed_call(
-            lambda probs_i=probs_i, i=i, clk_jac_i=clk_jac_i, ll_jac_probs_i=ll_jac_probs_i, ll_hess_probs_i=ll_hess_probs_i: ll_jac(
-                probs_i,
-                clk_[i],
-                clk_jac_i,
-                ll_jac_probs_i,
-                ll_hess_probs_i,
+def _prepare_inputs(log_components, endog_dummies, observation_weights, group_weights):
+    logs = jnp.asarray(log_components)
+    if logs.ndim != 2 or min(logs.shape) == 0:
+        raise ValueError("Log components must have nonempty shape (nobs, nsupp).")
+    if logs.dtype != jnp.float64:
+        raise TypeError("Profile likelihoods require float64 log components.")
+    nobs = logs.shape[0]
+    if endog_dummies is None:
+        indices = (np.arange(nobs),)
+    else:
+        masks = np.asarray(endog_dummies)
+        if masks.dtype != bool or masks.ndim != 2 or masks.shape[0] != nobs:
+            raise ValueError(
+                "endog_dummies must be a concrete boolean (nobs, ngroups) partition."
             )
-        )
-        primal_out_i, negloglik_seconds = _timed_call(
-            lambda probs_i=probs_i, i=i: (i.sum() / nobs) * negloglik_numeric(probs_i, lclk_[i, :])
-        )
-        tangent_out_i = (i.sum() / nobs) * theta_jac_i
-
-        primal_terms.append(primal_out_i)
-        tangent_terms.append(tangent_out_i)
-        probs_out.append(probs_i)
-        mixsolve_total += mixsolve_seconds
-        ll_jac_total += ll_jac_seconds
-        negloglik_total += negloglik_seconds
-        diagnostics["groups"].append(
-            {
-                "group_index": group_index,
-                "group_size": int(i.sum()),
-                "mixsolve_seconds": mixsolve_seconds,
-                "ll_jac_seconds": ll_jac_seconds,
-                "negloglik_seconds": negloglik_seconds,
-            }
-        )
-
-    primal_out, primal_seconds = _timed_call(lambda: sum(primal_terms))
-    tangent_template, tangent_seconds = _timed_call(lambda: sum(tangent_terms))
-    probs_stacked, probs_seconds = _timed_call(lambda: np.column_stack(probs_out))
-
-    diagnostics["lclk_seconds"] = lclk_seconds
-    diagnostics["clk_seconds"] = clk_seconds
-    diagnostics["clk_jac_seconds"] = clk_jac_seconds
-    diagnostics["mixsolve_seconds"] = mixsolve_total
-    diagnostics["ll_jac_seconds"] = ll_jac_total
-    diagnostics["negloglik_seconds"] = negloglik_total
-    diagnostics["primal_seconds"] = primal_seconds
-    diagnostics["tangent_template_seconds"] = tangent_seconds
-    diagnostics["probs_seconds"] = probs_seconds
-    diagnostics["primal_out"] = primal_out
-    diagnostics["tangent_template"] = tangent_template
-    diagnostics["probs"] = probs_stacked
-    diagnostics["total_seconds"] = (
-        lclk_seconds
-        + clk_seconds
-        + clk_jac_seconds
-        + mixsolve_total
-        + ll_jac_total
-        + negloglik_total
-        + primal_seconds
-        + tangent_seconds
-        + probs_seconds
+        if (
+            masks.shape[1] == 0
+            or not np.all(masks.sum(axis=1) == 1)
+            or not np.all(masks.any(axis=0))
+        ):
+            raise ValueError(
+                "Groups must be nonempty and each observation must belong to exactly one group."
+            )
+        indices = tuple(np.flatnonzero(mask) for mask in masks.T)
+    weights = (
+        jnp.ones(nobs, dtype=logs.dtype)
+        if observation_weights is None
+        else jnp.asarray(observation_weights, dtype=logs.dtype)
     )
-    return diagnostics
+    if weights.shape != (nobs,):
+        raise ValueError("observation_weights must have shape (nobs,).")
+    weights = _checked_weights(weights)
+    logs = jnp.where((weights[:, None] == 0) & ~jnp.isfinite(logs), 0.0, logs)
+    if group_weights is None:
+        normalized = normalized_weights(weights)
+        aggregation = jnp.stack([jnp.sum(normalized[index]) for index in indices])
+    else:
+        aggregation = jnp.asarray(group_weights, dtype=logs.dtype)
+        if aggregation.shape != (len(indices),):
+            raise ValueError("group_weights must have shape (ngroups,).")
+        aggregation = normalized_weights(_checked_weights(aggregation))
+    return logs, weights, indices, aggregation
 
 
-def _timed_mixsolve(lclk_group):
-    result, elapsed = _timed_call(lambda: mixsolve(lclk_group))
-    probs_i, ll_jac_probs_i, ll_hess_probs_i, *_ = result
-    return probs_i, ll_jac_probs_i, ll_hess_probs_i, elapsed
+@partial(jax.jit, static_argnums=(3,))
+def _group_value(logs, weights, probabilities, options):
+    regularized = regularized_log_components(
+        logs, options.density_offset(logs.shape[0])
+    )
+    if options.differentiation == "envelope":
+        return envelope_value(regularized, weights, probabilities)
+    return mixture_value(regularized, weights, probabilities)
 
 
-def _timed_call(fn):
+def profile_mixture(
+    log_components: jax.Array,
+    endog_dummies: np.ndarray | None = None,
+    *,
+    observation_weights: jax.Array | None = None,
+    group_weights: jax.Array | None = None,
+    options: ProfileOptions = ProfileOptions(),
+) -> tuple[jax.Array, jax.Array]:
+    """Return negative mean profile likelihood and (nsupp, ngroups) masses.
+
+    Groups are a concrete partition closed over by a JIT-compiled objective.
+    Observation weights enter each Rust solve; group weights determine the
+    outer aggregation and default to each group's share of observation weight.
+    The inverse-sample-size offset uses the number of supplied rows per group.
+    """
+    logs, weights, indices, aggregation = _prepare_inputs(
+        log_components, endog_dummies, observation_weights, group_weights
+    )
+    values, probabilities = [], []
+    for index in indices:
+        group_logs, group_weights_ = logs[index], weights[index]
+        masses = solve_mixture_weights(
+            group_logs,
+            group_weights_,
+            options.density_offset(len(index)),
+            options.solver,
+        )
+        probabilities.append(masses)
+        values.append(_group_value(group_logs, group_weights_, masses, options))
+    return jnp.dot(aggregation, jnp.stack(values)), jnp.column_stack(probabilities)
+
+
+def profile_ll(
+    model: ModelWithLCLK,
+    data: Any,
+    supp: jax.Array,
+    endog_dummies: np.ndarray | None = None,
+    *,
+    observation_weights: jax.Array | None = None,
+    group_weights: jax.Array | None = None,
+    options: ProfileOptions = ProfileOptions(),
+) -> tuple[jax.Array, jax.Array]:
+    """Profile model.lclk with full implicit differentiation by default."""
+    return profile_mixture(
+        model.lclk(data, supp),
+        endog_dummies,
+        observation_weights=observation_weights,
+        group_weights=group_weights,
+        options=options,
+    )
+
+
+def _timed_call(fn: Callable[[], Any]) -> tuple[Any, float]:
     start = perf_counter()
     value = fn()
-    _sync_tree(value)
-    elapsed = perf_counter() - start
-    return value, elapsed
-
-
-def _sync_tree(value):
     for leaf in jax.tree_util.tree_leaves(value):
         if hasattr(leaf, "block_until_ready"):
             leaf.block_until_ready()
+    return value, perf_counter() - start
 
 
-def _default_groups(data, endog_dummies, weights):
-    """
-    Create a default group structure for the endog_dummies.
-    """
-    if endog_dummies is None:
-        nobs = _get_nobs(data)
-        endog_dummies = onp.ones((nobs, 1)).astype(onp.bool_)
-        weights = onp.ones((nobs, 1)) / nobs
+def _diagnose(
+    log_components,
+    endog_dummies,
+    observation_weights,
+    group_weights,
+    options,
+    gradient_call,
+    log_seconds,
+):
+    start = perf_counter()
+    logs, weights, indices, aggregation = _prepare_inputs(
+        log_components, endog_dummies, observation_weights, group_weights
+    )
+    groups, values, probabilities = [], [], []
+    for group_index, index in enumerate(indices):
+        offset = options.density_offset(len(index))
+        result, solve_seconds = _timed_call(
+            lambda: rust_solve(logs[index], weights[index], offset, options.solver)
+        )
+        value, value_seconds = _timed_call(
+            lambda: _group_value(
+                logs[index], weights[index], result.probabilities, options
+            )
+        )
+        probabilities.append(result.probabilities)
+        values.append(value)
+        groups.append(
+            GroupDiagnostics(
+                group_index=group_index,
+                nobs=len(index),
+                density_offset=offset,
+                aggregation_weight=float(aggregation[group_index]),
+                objective=float(value),
+                solver_info=result.info,
+                solve_seconds=solve_seconds,
+                value_seconds=value_seconds,
+            )
+        )
+    objective = jnp.dot(aggregation, jnp.stack(values))
+    objective.block_until_ready()
+    gradient = gradient_seconds = objective_error = None
+    if gradient_call is not None and all(group.converged for group in groups):
+        (gradient_value, gradient), gradient_seconds = _timed_call(gradient_call)
+        objective_error = float(jnp.abs(gradient_value - objective))
+    return ProfileDiagnostics(
+        nobs=logs.shape[0],
+        nsupp=logs.shape[1],
+        ngroups=len(indices),
+        options=options,
+        objective=objective,
+        probabilities=jnp.column_stack(probabilities),
+        groups=tuple(groups),
+        log_components_seconds=log_seconds,
+        solve_seconds=sum(group.solve_seconds for group in groups),
+        value_seconds=sum(group.value_seconds for group in groups),
+        total_seconds=log_seconds + perf_counter() - start,
+        gradient=gradient,
+        gradient_seconds=gradient_seconds,
+        gradient_objective_error=objective_error,
+    )
 
-    return endog_dummies, weights
+
+def profile_ll_diagnostics(
+    model: ModelWithLCLK,
+    data: Any,
+    supp: jax.Array,
+    endog_dummies: np.ndarray | None = None,
+    *,
+    observation_weights: jax.Array | None = None,
+    group_weights: jax.Array | None = None,
+    options: ProfileOptions = ProfileOptions(),
+    include_gradient: bool = True,
+) -> ProfileDiagnostics:
+    """Inspect the same criterion and report each Rust convergence certificate."""
+    logs, log_seconds = _timed_call(lambda: model.lclk(data, supp))
+
+    def criterion(point):
+        return profile_ll(
+            point,
+            data,
+            supp,
+            endog_dummies,
+            observation_weights=observation_weights,
+            group_weights=group_weights,
+            options=options,
+        )[0]
+
+    gradient_call = (
+        (lambda: jax.jit(jax.value_and_grad(criterion))(model))
+        if include_gradient
+        else None
+    )
+    return _diagnose(
+        logs,
+        endog_dummies,
+        observation_weights,
+        group_weights,
+        options,
+        gradient_call,
+        log_seconds,
+    )
 
 
+def profile_mixture_diagnostics(
+    log_components: jax.Array,
+    endog_dummies: np.ndarray | None = None,
+    *,
+    observation_weights: jax.Array | None = None,
+    group_weights: jax.Array | None = None,
+    options: ProfileOptions = ProfileOptions(),
+    include_gradient: bool = False,
+) -> ProfileDiagnostics:
+    def criterion(logs):
+        return profile_mixture(
+            logs,
+            endog_dummies,
+            observation_weights=observation_weights,
+            group_weights=group_weights,
+            options=options,
+        )[0]
 
-def _get_nobs(data):
-    vals = list(data.values())[0]
-    if isinstance(vals, dict):
-        return _get_nobs(vals)
-    else:
-        return vals.shape[0]
+    gradient_call = (
+        (lambda: jax.jit(jax.value_and_grad(criterion))(log_components))
+        if include_gradient
+        else None
+    )
+    return _diagnose(
+        log_components,
+        endog_dummies,
+        observation_weights,
+        group_weights,
+        options,
+        gradient_call,
+        0.0,
+    )

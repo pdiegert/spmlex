@@ -52,7 +52,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
+    { name = "pycparser" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -537,20 +537,17 @@ wheels = [
 
 [[package]]
 name = "mixsqpx"
-version = "0.1.5"
-source = { path = "../mixsqpx/dist/mixsqpx-0.1.5-cp312-abi3-linux_x86_64.whl" }
+version = "0.2.3a1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/66/56/6b131a71455b08802aeaba7f58ee39eeadaf288b2f1301bf3f579fa369df/mixsqpx-0.2.3a1.tar.gz", hash = "sha256:0dc79a5854d046a804493b1d513d0d591a728f809d414323c5d029efb44fb228", size = 9497091, upload-time = "2026-10-22T11:11:30.668Z" }
 wheels = [
-    { filename = "mixsqpx-0.1.5-cp312-abi3-linux_x86_64.whl", hash = "sha256:09e8b251e462bbbf7b8e24de3e5494ec7a9ee0ae38a3d1f8a8ed108ee794eec0" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "jax", specifier = "<=0.9.2,>=0.9.2" },
-    { name = "jaxlib", specifier = "<=0.9.2,>=0.9.2" },
+    { url = "https://files.pythonhosted.org/packages/ab/62/620a6b6c9574d94298a9b1efd43f2a3eaf0b4d3d03264c761933d31b704e/mixsqpx-0.2.3a1-py3-none-macosx_26_0_arm64.whl", hash = "sha256:5edc0a7db372117c766a7bdadf998109940ed9afe66822fc1af549aa851242e7", size = 237681, upload-time = "2026-10-22T11:11:27.126Z" },
+    { url = "https://files.pythonhosted.org/packages/32/93/4513283b07678133a55f679e25166039efa4368b9c60f0c221518c21e803/mixsqpx-0.2.3a1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:c219e15d6f1dd891785cff3dabe3ab78b29ab6fa4a424055512ec36300d0dc6c", size = 290931, upload-time = "2026-10-22T11:11:28.45Z" },
+    { url = "https://files.pythonhosted.org/packages/63/4f/f4741905d95cead8eaad1b973efe94e2599820ce10bca3a8863698efdc52/mixsqpx-0.2.3a1-py3-none-win_amd64.whl", hash = "sha256:ef6687f449b19a46e83859ae4b2a9dbbcddb78ca33f9f31b151fcf34660f44cb", size = 171743, upload-time = "2026-10-22T11:11:29.489Z" },
 ]
 
 [[package]]
@@ -1138,7 +1135,7 @@ requires-dist = [
     { name = "equinox", specifier = ">=0.13.6,<0.14" },
     { name = "jax", specifier = "<=0.9.2,>=0.9.2" },
     { name = "jaxlib", specifier = "<=0.9.2,>=0.9.2" },
-    { name = "mixsqpx", path = "../mixsqpx/dist/mixsqpx-0.1.5-cp312-abi3-linux_x86_64.whl" },
+    { name = "mixsqpx", specifier = "==0.2.3a1" },
 ]
 
 [package.metadata.requires-dev]
